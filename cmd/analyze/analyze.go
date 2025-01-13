@@ -1,29 +1,46 @@
+/*
+Copyright 2023 The K8sGPT Authors.
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package analyze
 
 import (
-	"context"
-	"encoding/json"
 	"fmt"
 	"os"
-	"strings"
+	"os/signal"
+	"syscall"
 
 	"github.com/fatih/color"
-	"github.com/k8sgpt-ai/k8sgpt/pkg/ai"
-	"github.com/k8sgpt-ai/k8sgpt/pkg/analyzer"
-	"github.com/k8sgpt-ai/k8sgpt/pkg/kubernetes"
-	"github.com/schollz/progressbar/v3"
+	"github.com/k8sgpt-ai/k8sgpt/pkg/ai/interactive"
+	"github.com/k8sgpt-ai/k8sgpt/pkg/analysis"
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
 )
 
 var (
-	explain   bool
-	backend   string
-	output    string
-	filters   []string
-	language  string
-	nocache   bool
-	namespace string
+	explain         bool
+	backend         string
+	output          string
+	filters         []string
+	language        string
+	nocache         bool
+	namespace       string
+	labelSelector   string
+	anonymize       bool
+	maxConcurrency  int
+	withDoc         bool
+	interactiveMode bool
+	customAnalysis  bool
+	customHeaders   []string
+	withStats       bool
 )
 
 // AnalyzeCmd represents the problems command
@@ -34,124 +51,109 @@ var AnalyzeCmd = &cobra.Command{
 	Long: `This command will find problems within your Kubernetes cluster and
 	provide you with a list of issues that need to be resolved`,
 	Run: func(cmd *cobra.Command, args []string) {
+		// Create analysis configuration first.
+		config, err := analysis.NewAnalysis(
+			backend,
+			language,
+			filters,
+			namespace,
+			labelSelector,
+			nocache,
+			explain,
+			maxConcurrency,
+			withDoc,
+			interactiveMode,
+			customHeaders,
+			withStats,
+		)
 
-		// get backend from file
-		backendType := viper.GetString("backend_type")
-		if backendType == "" {
-			color.Red("No backend set. Please run k8sgpt auth")
+		if err != nil {
+			color.Red("Error: %v", err)
 			os.Exit(1)
 		}
-		// override the default backend if a flag is provided
-		if backend != "" {
-			backendType = backend
-		}
-		// get the token with viper
-		token := viper.GetString(fmt.Sprintf("%s_key", backendType))
-		// check if nil
-		if token == "" {
-			color.Red("No %s key set. Please run k8sgpt auth", backendType)
-			os.Exit(1)
-		}
+		defer config.Close()
 
-		var aiClient ai.IAI
-		switch backendType {
-		case "openai":
-			aiClient = &ai.OpenAIClient{}
-			if err := aiClient.Configure(token, language); err != nil {
+		if customAnalysis {
+			config.RunCustomAnalysis()
+		}
+		config.RunAnalysis()
+
+		if explain {
+			if err := config.GetAIResults(output, anonymize); err != nil {
 				color.Red("Error: %v", err)
 				os.Exit(1)
 			}
-		default:
-			color.Red("Backend not supported")
-			os.Exit(1)
 		}
-
-		ctx := context.Background()
-		// Get kubernetes client from viper
-		client := viper.Get("kubernetesClient").(*kubernetes.Client)
-		// Analysis configuration
-		config := &analyzer.AnalysisConfiguration{
-			Namespace: namespace,
-			NoCache:   nocache,
-			Explain:   explain,
-		}
-
-		var analysisResults *[]analyzer.Analysis = &[]analyzer.Analysis{}
-		if err := analyzer.RunAnalysis(ctx, filters, config, client,
-			aiClient, analysisResults); err != nil {
+		// print results
+		output_data, err := config.PrintOutput(output)
+		if err != nil {
 			color.Red("Error: %v", err)
 			os.Exit(1)
 		}
 
-		var bar *progressbar.ProgressBar
-		if len(*analysisResults) > 0 {
-			bar = progressbar.Default(int64(len(*analysisResults)))
-		} else {
-			color.Green("{ \"status\": \"OK\" }")
-			os.Exit(0)
+		if withStats {
+			statsData := config.PrintStats()
+			fmt.Println(string(statsData))
 		}
 
-		// This variable is used to store the results that will be printed
-		// It's necessary because the heap memory is lost when the function returns
-		var printOutput []analyzer.Analysis
+		fmt.Println(string(output_data))
 
-		for _, analysis := range *analysisResults {
-
-			if explain {
-				parsedText, err := analyzer.ParseViaAI(ctx, config, aiClient, analysis.Error)
-				if err != nil {
-					// Check for exhaustion
-					if strings.Contains(err.Error(), "status code: 429") {
-						color.Red("Exhausted API quota. Please try again later")
-						os.Exit(1)
-					}
-					color.Red("Error: %v", err)
-					continue
-				}
-				analysis.Details = parsedText
-				bar.Add(1)
+		if interactiveMode && explain {
+			if output == "json" {
+				color.Yellow("Caution: interactive mode using --json enabled may use additional tokens.")
 			}
-			printOutput = append(printOutput, analysis)
-		}
+			sigs := make(chan os.Signal, 1)
+			signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+			interactiveClient := interactive.NewInteractionRunner(config, output_data)
 
-		// print results
-		for n, analysis := range printOutput {
-
-			switch output {
-			case "json":
-				analysis.Error = analysis.Error[0:]
-				j, err := json.Marshal(analysis)
-				if err != nil {
-					color.Red("Error: %v", err)
-					os.Exit(1)
+			go interactiveClient.StartInteraction()
+			for {
+				select {
+				case res := <-sigs:
+					switch res {
+					default:
+						os.Exit(0)
+					}
+				case res := <-interactiveClient.State:
+					switch res {
+					case interactive.E_EXITED:
+						os.Exit(0)
+					}
 				}
-				fmt.Println(string(j))
-			default:
-				fmt.Printf("%s %s(%s)\n", color.CyanString("%d", n),
-					color.YellowString(analysis.Name), color.CyanString(analysis.ParentObject))
-				for _, err := range analysis.Error {
-					fmt.Printf("- %s %s\n", color.RedString("Error:"), color.RedString(err))
-				}
-				color.GreenString(analysis.Details)
 			}
 		}
 	},
 }
 
 func init() {
-
 	// namespace flag
 	AnalyzeCmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace to analyze")
 	// no cache flag
 	AnalyzeCmd.Flags().BoolVarP(&nocache, "no-cache", "c", false, "Do not use cached data")
+	// anonymize flag
+	AnalyzeCmd.Flags().BoolVarP(&anonymize, "anonymize", "a", false, "Anonymize data before sending it to the AI backend. This flag masks sensitive data, such as Kubernetes object names and labels, by replacing it with a key. However, please note that this flag does not currently apply to events.")
 	// array of strings flag
 	AnalyzeCmd.Flags().StringSliceVarP(&filters, "filter", "f", []string{}, "Filter for these analyzers (e.g. Pod, PersistentVolumeClaim, Service, ReplicaSet)")
 	// explain flag
 	AnalyzeCmd.Flags().BoolVarP(&explain, "explain", "e", false, "Explain the problem to me")
 	// add flag for backend
-	AnalyzeCmd.Flags().StringVarP(&backend, "backend", "b", "openai", "Backend AI provider")
+	AnalyzeCmd.Flags().StringVarP(&backend, "backend", "b", "", "Backend AI provider")
 	// output as json
 	AnalyzeCmd.Flags().StringVarP(&output, "output", "o", "text", "Output format (text, json)")
 	// add language options for output
 	AnalyzeCmd.Flags().StringVarP(&language, "language", "l", "english", "Languages to use for AI (e.g. 'English', 'Spanish', 'French', 'German', 'Italian', 'Portuguese', 'Dutch', 'Russian', 'Chinese', 'Japanese', 'Korean')")
+	// add max concurrency
+	AnalyzeCmd.Flags().IntVarP(&maxConcurrency, "max-concurrency", "m", 10, "Maximum number of concurrent requests to the Kubernetes API server")
+	// kubernetes doc flag
+	AnalyzeCmd.Flags().BoolVarP(&withDoc, "with-doc", "d", false, "Give me the official documentation of the involved field")
+	// interactive mode flag
+	AnalyzeCmd.Flags().BoolVarP(&interactiveMode, "interactive", "i", false, "Enable interactive mode that allows further conversation with LLM about the problem. Works only with --explain flag")
+	// custom analysis flag
+	AnalyzeCmd.Flags().BoolVarP(&customAnalysis, "custom-analysis", "z", false, "Enable custom analyzers")
+	// add custom headers flag
+	AnalyzeCmd.Flags().StringSliceVarP(&customHeaders, "custom-headers", "r", []string{}, "Custom Headers, <key>:<value> (e.g CustomHeaderKey:CustomHeaderValue AnotherHeader:AnotherValue)")
+	// label selector flag
+	AnalyzeCmd.Flags().StringVarP(&labelSelector, "selector", "L", "", "Label selector (label query) to filter on, supports '=', '==', and '!='. (e.g. -L key1=value1,key2=value2). Matching objects must satisfy all of the specified label constraints.")
+	// print stats
+	AnalyzeCmd.Flags().BoolVarP(&withStats, "with-stat", "s", false, "Print analysis stats. This option disables errors display.")
 }

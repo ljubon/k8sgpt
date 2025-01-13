@@ -1,83 +1,122 @@
+/*
+Copyright 2023 The K8sGPT Authors.
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package analyzer
 
 import (
-	"context"
-	"encoding/base64"
-	"strings"
+	"fmt"
+	"os"
 
 	"github.com/fatih/color"
-	"github.com/k8sgpt-ai/k8sgpt/pkg/ai"
-	"github.com/k8sgpt-ai/k8sgpt/pkg/kubernetes"
-	"github.com/spf13/viper"
+	"github.com/k8sgpt-ai/k8sgpt/pkg/common"
+	"github.com/k8sgpt-ai/k8sgpt/pkg/integration"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-var analyzerMap = map[string]func(ctx context.Context, config *AnalysisConfiguration,
-	client *kubernetes.Client, aiClient ai.IAI, analysisResults *[]Analysis) error{
-	"Pod":                   AnalyzePod,
-	"ReplicaSet":            AnalyzeReplicaSet,
-	"PersistentVolumeClaim": AnalyzePersistentVolumeClaim,
-	"Service":               AnalyzeEndpoints,
-	"Ingress":               AnalyzeIngress,
+var (
+	AnalyzerErrorsMetric = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "analyzer_errors",
+		Help: "Number of errors detected by analyzer",
+	}, []string{"analyzer_name", "object_name", "namespace"})
+)
+
+var coreAnalyzerMap = map[string]common.IAnalyzer{
+	"Pod":                            PodAnalyzer{},
+	"Deployment":                     DeploymentAnalyzer{},
+	"ReplicaSet":                     ReplicaSetAnalyzer{},
+	"PersistentVolumeClaim":          PvcAnalyzer{},
+	"Service":                        ServiceAnalyzer{},
+	"Ingress":                        IngressAnalyzer{},
+	"StatefulSet":                    StatefulSetAnalyzer{},
+	"CronJob":                        CronJobAnalyzer{},
+	"Node":                           NodeAnalyzer{},
+	"ValidatingWebhookConfiguration": ValidatingWebhookAnalyzer{},
+	"MutatingWebhookConfiguration":   MutatingWebhookAnalyzer{},
 }
 
-func RunAnalysis(ctx context.Context, filters []string, config *AnalysisConfiguration,
-	client *kubernetes.Client,
-	aiClient ai.IAI, analysisResults *[]Analysis) error {
-
-	// if there are no filters selected then run all of them
-	if len(filters) == 0 {
-		for _, analyzer := range analyzerMap {
-			if err := analyzer(ctx, config, client, aiClient, analysisResults); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-
-	for _, filter := range filters {
-		if analyzer, ok := analyzerMap[filter]; ok {
-			if err := analyzer(ctx, config, client, aiClient, analysisResults); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+var additionalAnalyzerMap = map[string]common.IAnalyzer{
+	"HorizontalPodAutoScaler": HpaAnalyzer{},
+	"PodDisruptionBudget":     PdbAnalyzer{},
+	"NetworkPolicy":           NetworkPolicyAnalyzer{},
+	"Log":                     LogAnalyzer{},
+	"GatewayClass":            GatewayClassAnalyzer{},
+	"Gateway":                 GatewayAnalyzer{},
+	"HTTPRoute":               HTTPRouteAnalyzer{},
 }
 
-func ParseViaAI(ctx context.Context, config *AnalysisConfiguration,
-	aiClient ai.IAI, prompt []string) (string, error) {
-	// parse the text with the AI backend
-	inputKey := strings.Join(prompt, " ")
-	// Check for cached data
-	sEnc := base64.StdEncoding.EncodeToString([]byte(inputKey))
-	// find in viper cache
-	if viper.IsSet(sEnc) && !config.NoCache {
-		// retrieve data from cache
-		response := viper.GetString(sEnc)
-		if response == "" {
-			color.Red("error retrieving cached data")
-			return "", nil
+func ListFilters() ([]string, []string, []string) {
+	coreKeys := make([]string, 0, len(coreAnalyzerMap))
+	for k := range coreAnalyzerMap {
+		coreKeys = append(coreKeys, k)
+	}
+
+	additionalKeys := make([]string, 0, len(additionalAnalyzerMap))
+	for k := range additionalAnalyzerMap {
+		additionalKeys = append(additionalKeys, k)
+	}
+
+	integrationProvider := integration.NewIntegration()
+	var integrationAnalyzers []string
+
+	for _, i := range integrationProvider.List() {
+		b, _ := integrationProvider.IsActivate(i)
+		if b {
+			in, err := integrationProvider.Get(i)
+			if err != nil {
+				fmt.Println(color.RedString(err.Error()))
+				os.Exit(1)
+			}
+			integrationAnalyzers = append(integrationAnalyzers, in.GetAnalyzerName()...)
 		}
-		output, err := base64.StdEncoding.DecodeString(response)
+	}
+
+	return coreKeys, additionalKeys, integrationAnalyzers
+}
+
+func GetAnalyzerMap() (map[string]common.IAnalyzer, map[string]common.IAnalyzer) {
+
+	coreAnalyzer := make(map[string]common.IAnalyzer)
+	mergedAnalyzerMap := make(map[string]common.IAnalyzer)
+
+	// add core analyzer
+	for key, value := range coreAnalyzerMap {
+		coreAnalyzer[key] = value
+		mergedAnalyzerMap[key] = value
+	}
+
+	// add additional analyzer
+	for key, value := range additionalAnalyzerMap {
+		mergedAnalyzerMap[key] = value
+	}
+
+	integrationProvider := integration.NewIntegration()
+
+	for _, i := range integrationProvider.List() {
+		b, err := integrationProvider.IsActivate(i)
 		if err != nil {
-			color.Red("error decoding cached data: %v", err)
-			return "", nil
+			fmt.Println(color.RedString(err.Error()))
+			os.Exit(1)
 		}
-		return string(output), nil
-	}
-
-	response, err := aiClient.GetCompletion(ctx, inputKey)
-	if err != nil {
-		color.Red("error getting completion: %v", err)
-		return "", err
-	}
-
-	if !viper.IsSet(sEnc) {
-		viper.Set(sEnc, base64.StdEncoding.EncodeToString([]byte(response)))
-		if err := viper.WriteConfig(); err != nil {
-			color.Red("error writing config: %v", err)
-			return "", nil
+		if b {
+			in, err := integrationProvider.Get(i)
+			if err != nil {
+				fmt.Println(color.RedString(err.Error()))
+				os.Exit(1)
+			}
+			in.AddAnalyzer(&mergedAnalyzerMap)
 		}
 	}
-	return response, nil
+
+	return coreAnalyzer, mergedAnalyzerMap
 }
